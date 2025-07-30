@@ -19,6 +19,22 @@
         "*.inc": "c",
         "lib.h": "c",
         "inode.h": "c",
-        "interrupt.h": "c"
+        "interrupt.h": "c",
+        "file.h": "c",
+        "off_t.h": "c",
+        "loader.h": "c",
+        "filesys.h": "c",
+        "syscall.h": "c",
+        "synch.h": "c",
+        "mmu.h": "c",
+        "types.h": "c",
+        "gdt.h": "c",
+        "process.h": "c",
+        "flags.h": "c",
+        "vaddr.h": "c",
+        "util.h": "c",
+        "stddef.h": "c",
+        "main.h": "c",
+        "init.h": "c"
     },
 }

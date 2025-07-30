@@ -3,25 +3,24 @@
 #include <stdio.h>
 #include <syscall-nr.h>
 
+#include "include/devices/input.h"
 #include "include/filesys/file.h"
 #include "include/filesys/filesys.h"
+#include "include/lib/string.h"
+#include "include/lib/user/syscall.h"
+#include "include/threads/init.h"
 #include "include/userprog/process.h"
 #include "intrinsic.h"
 #include "lib/kernel/console.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/loader.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "userprog/gdt.h"
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
-static bool check_bad_addr();
-static int write_handler(int fd, const void *buffer, unsigned size);
-static int close_handler(int fd);
-struct file *process_get_file(int fd);
-
-static int write_handler(int fd, const void *buffer, unsigned size);
 
 /* System call.
  *
@@ -36,7 +35,31 @@ static int write_handler(int fd, const void *buffer, unsigned size);
 #define MSR_LSTAR 0xc0000082        /* Long mode SYSCALL target */
 #define MSR_SYSCALL_MASK 0xc0000084 /* Mask for the eflags */
 
-// 시스템 초기화 시 시스템 콜 벡터 설정 등의 초기화 작업 수행
+struct lock filesys_lock;
+
+/* check address for validation
+ * - 커널 영역 접근 차단
+ * - 미매핑 페이지 차단 */
+void check_address(void *vaddr)
+{
+    struct thread *curr = thread_current();
+    if (vaddr == NULL || !is_user_vaddr(vaddr) ||
+        pml4_get_page(curr->pml4, vaddr) == NULL)
+    {
+        exit(-1);
+    }
+}
+
+/* protect from bad file descriptor number */
+void check_fd(int fd)
+{
+    if (fd < 0 || fd > FDTABLE_SIZE)
+    {
+        exit(-1);
+    }
+}
+
+/* 시스템 초기화 시 시스템 콜 벡터 설정 등의 초기화 작업 수행 */
 void syscall_init(void)
 {
     write_msr(MSR_STAR, ((uint64_t) SEL_UCSEG - 0x10) << 48 |
@@ -48,27 +71,316 @@ void syscall_init(void)
      * mode stack. Therefore, we masked the FLAG_FL. */
     write_msr(MSR_SYSCALL_MASK,
               FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
+
+    /* initialize filesys lock */
+    lock_init(&filesys_lock);
+}
+
+/* system power off */
+void halt(void)
+{
+    power_off();
+}
+
+/* exit with given status number */
+void exit(int status)
+{
+    struct thread *t = thread_current();
+    t->exit_status = status;
+    printf("%s: exit(%d)\n", t->name,
+           t->exit_status); /* Process Termination Message */
+
+    if (lock_held_by_current_thread(&filesys_lock))
+    {
+        lock_release(&filesys_lock);
+    }
+
+    thread_exit();
+}
+
+// pid_t fork(const char *thread_name)
+// {
+//     struct intr_frame *if_ =
+//         pg_round_up(&thread_name) - sizeof(struct intr_frame);
+//     return process_fork(thread_name, if_);
+// }
+
+/* execute program with given file name */
+int exec(const char *file)
+{
+    check_address(file);
+
+    int result = process_exec(file);
+    if (result == -1)
+    {
+        exit(-1);
+    }
+
+    return result;
+}
+
+/* wait process until it's finish (exit) */
+int wait(pid_t pid)
+{
+    return process_wait(pid);
+}
+
+bool create(const char *file, unsigned initial_size)
+{
+    bool file_create_result = false;
+
+    check_address(file);
+
+    lock_acquire(&filesys_lock);
+    file_create_result = filesys_create(file, initial_size);
+    lock_release(&filesys_lock);
+    return file_create_result;
+}
+
+bool remove(const char *file)
+{
+    check_address(file);
+
+    bool file_remove_result = false;
+
+    lock_acquire(&filesys_lock);
+    file_remove_result = filesys_remove(file);
+    lock_release(&filesys_lock);
+
+    return file_remove_result;
+}
+
+int open(const char *file)
+{
+    check_address(file);
+
+    lock_acquire(&filesys_lock);
+    struct file *open_file = filesys_open(file);
+    lock_release(&filesys_lock);
+
+    if (open_file != NULL)
+    {
+        return process_add_file(open_file);
+    }
+    else
+    {
+        return -1;
+    }
+}
+
+int filesize(int fd)
+{
+    check_fd(fd);
+
+    struct uni_file *uni_file = process_get_file(fd);
+    if (uni_file == NULL)
+    {
+        return -1;
+    }
+
+    struct file *file = uni_file->ptr;
+    if (file == NULL)
+    {
+        return -1;
+    }
+
+    return file_length(file);
+}
+
+int read(int fd, void *buffer, unsigned length)
+{
+    check_address(buffer);
+    check_fd(fd);
+
+    int bytes_read;
+
+    if (fd == FD_STDIN)
+    {
+        /* >> (1) STDIN - 키보드에서 length 바이트만큼 읽기 */
+        unsigned i;
+        for (i = 0; i < length; i++)
+        {
+            /* 한 글자씩 채움 */
+            ((char *) buffer)[i] = input_getc();
+        }
+
+        return length;
+    }
+    else if (fd == FD_STDOUT)
+    {
+        /* >> (2) STDOUT - Not allowed to read on Write-Only file */
+        return -1;
+    }
+    else
+    {
+        /* >> (3): read from file */
+        struct uni_file *uni_file = process_get_file(fd);
+        if (uni_file == NULL)
+        {
+            return -1;
+        }
+
+        struct file *file = uni_file->ptr;
+        if (file == NULL)
+        {
+            return -1;
+        }
+
+        lock_acquire(&filesys_lock);
+        bytes_read = file_read(file, buffer, length);
+        lock_release(&filesys_lock);
+
+        return bytes_read;
+    }
+}
+
+int write(int fd, const void *buffer, unsigned size)
+{
+    check_address(buffer);
+    check_fd(fd);
+
+    struct thread *curr = thread_current();
+
+    if (fd == FD_STDIN)
+    {
+        /* >> (1): writing on Read-Only file is not allowed */
+        return -1;
+    }
+    else if (fd == FD_STDOUT)
+    {
+        /* >> (2): write on STDOUT */
+        putbuf((char *) buffer, size);
+        return size;
+    }
+    else
+    {
+        /* >> (3): write on file */
+        struct uni_file *uni_file = process_get_file(fd);
+        if (uni_file == NULL)
+        {
+            return -1;
+        }
+
+        struct file *file = uni_file->ptr;
+        if (file == NULL)
+        {
+            return -1;
+        }
+
+        lock_acquire(&filesys_lock);
+        int bytes_written = file_write(file, buffer, size);
+        lock_release(&filesys_lock);
+        return bytes_written;
+    }
+}
+
+/* fd로 열린 파일에서 읽거나 쓸 다음 바이트를 파일 시작부터 position(바이트
+ * 단위) 위치로 설정합니다. (따라서 position이 0이면 파일의 시작을 의미합니다.)
+ * 파일의 현재 끝을 넘어서는 seek는 오류가 아닙니다. 이후 read는 0바이트를
+ * 반환하여 파일 끝을 나타냅니다. 이후 write는 파일을 확장하며,
+ * 쓰이지 않은 간격을 0으로 채웁니다.
+ * (그러나 Pintos에서는 프로젝트 4가 완료될 때까지 파일 길이가 고정되어
+ * 있으므로, 파일 끝을 넘는 쓰기는 오류를 반환합니다.) 이러한 동작 방식은 파일
+ * 시스템에 구현되어 있으므로 system call 구현에서 별도의 작업이 필요하지
+ * 않습니다. */
+void seek(int fd, unsigned position)
+{
+    check_fd(fd);
+
+    if (fd == FD_STDIN || fd == FD_STDOUT)
+    {
+        return;
+    }
+
+    struct uni_file *uni_file = process_get_file(fd);
+    if (uni_file == NULL)
+    {
+        return;
+    }
+
+    struct file *file = uni_file->ptr;
+    if (file == NULL)
+    {
+        return;
+    }
+
+    file_seek(file, position);
+}
+
+unsigned tell(int fd)
+{
+    check_fd(fd);
+
+    if (fd == FD_STDIN || fd == FD_STDOUT)
+    {
+        return 0;
+    }
+
+    struct uni_file *uni_file = process_get_file(fd);
+    if (uni_file == NULL)
+    {
+        return -1;
+    }
+
+    struct file *file = uni_file->ptr;
+    if (file == NULL)
+    {
+        return;
+    }
+
+    unsigned position = file_tell(file);
+    return position;
+}
+
+void close(int fd)
+{
+    check_fd(fd);
+
+    if (fd == FD_STDIN || fd == FD_STDOUT)
+    {
+        return;
+    }
+
+    struct thread *curr = thread_current();
+    struct uni_file *uni_file = curr->fd_table[fd];
+    if (uni_file == NULL)
+    {
+        return;
+    }
+
+    if (uni_file->type == FD_FILE && uni_file->ptr != NULL)
+    {
+        lock_acquire(&filesys_lock);
+        file_close((struct file *) uni_file->ptr);
+        lock_release(&filesys_lock);
+    }
+
+    free(uni_file);
+    curr->fd_table[fd] = NULL;
 }
 
 /* The main system call interface */
-// 어셈블리 코드(syscall-entry.S)로부터 제어를 넘겨받음
+/*
+ * 어셈블리 코드(syscall-entry.S)로부터 제어를 넘겨받음
+ * 인터럽트 프레임(struct intr_frame *f)을 통해 사용자 프로그램의
+ * 레지스터 상태와 시스템 콜 번호 및 인자들을 읽어옴
+ */
 void syscall_handler(struct intr_frame *f UNUSED)
 {
-    // 유저 스택에서 시스템콜 번호 꺼내기
+    /* 유저 스택에서 시스템콜 번호 꺼내기 */
     int syscall_number = f->R.rax;
 
     switch (syscall_number)
     {
         case SYS_HALT:
         {
-            power_off();
+            halt();
             break;
         }
         case SYS_EXIT:
         {
-            struct thread *curr = thread_current();
-            curr->exit_status = f->R.rdi;
-            thread_exit();
+            exit(f->R.rdi);
+            break;
         }
         case SYS_FORK:
         {
@@ -77,205 +389,58 @@ void syscall_handler(struct intr_frame *f UNUSED)
         }
         case SYS_EXEC:
         {
-            printf("exec syscall called!!!\n");
+            f->R.rax = exec(f->R.rdi);
             break;
         }
         case SYS_WAIT:
         {
-            f->R.rax = process_wait(f->R.rdi);
+            f->R.rax = wait(f->R.rdi);
             break;
         }
         case SYS_CREATE:
         {
-            const char *open_filename = (const char *) f->R.rdi;
-            int32_t filesize = f->R.rsi;
-            struct thread *curr = thread_current();
-
-            if (open_filename == NULL ||
-                check_bad_addr(open_filename, curr) == NULL)
-            {
-                curr->tf.R.rax = -1;
-                thread_exit();
-            }
-            else
-            {
-                f->R.rax = filesys_create(open_filename, filesize);
-                break;
-            }
+            f->R.rax = create(f->R.rdi, f->R.rsi);
+            break;
         }
         case SYS_REMOVE:
         {
-            printf("remove syscall called!!!\n");
+            f->R.rax = remove(f->R.rdi);
             break;
         }
         case SYS_OPEN:
         {
-            struct thread *curr = thread_current();
-            if (is_user_vaddr(f->R.rdi))
-            {
-                const char *open_filename = (const char *) f->R.rdi;
-                if (open_filename == NULL ||
-                    check_bad_addr(open_filename, curr) == NULL)
-                {
-                    curr->tf.R.rax = -1;
-                    thread_exit();
-                }
-                else
-                {
-                    struct file *open_file = filesys_open(open_filename);
-
-                    if (open_file != NULL)
-                    {
-                        f->R.rax = process_add_file(open_file);
-                    }
-                    else
-                    {
-                        f->R.rax = -1;
-                    }
-                    break;
-                }
-            }
+            f->R.rax = open(f->R.rdi);
+            break;
         }
         case SYS_FILESIZE:
         {
-            struct file *current_file = process_get_file(f->R.rdi);
-            f->R.rax = file_length(current_file);
+            f->R.rax = filesize(f->R.rdi);
             break;
         }
         case SYS_READ:
         {
-            struct thread *current_thread = thread_current();
-
-            if (!is_fd_readable(f->R.rdi) ||
-                check_bad_addr(f->R.rsi, current_thread) == NULL)
-            {
-                current_thread->tf.R.rax = -1;
-                thread_exit();
-            }
-
-            struct file *current_file = process_get_file(f->R.rdi);
-            f->R.rax = file_read(current_file, f->R.rsi, f->R.rdx);
+            f->R.rax = read(f->R.rdi, f->R.rsi, f->R.rdx);
             break;
         }
         case SYS_WRITE:
         {
-            // 인터럽트 프레임(struct intr_frame *f)을 통해 사용자 프로그램의
-            // 레지스터 상태와 시스템 콜 번호 및 인자들을 읽어옴 f->R.rax :
-            // 시스템 콜 반환값 (리턴값 저장) f->R.rdi : 첫 번째 인자 (fd)
-            // f->R.rsi : 두 번째 인자 (buffer)
-            // f->R.rdx : 세 번째 인자 (size)
-            f->R.rax = write_handler(f->R.rdi, f->R.rsi, f->R.rdx);
+            f->R.rax = write(f->R.rdi, f->R.rsi, f->R.rdx);
             break;
         }
         case SYS_SEEK:
         {
-            printf("seek syscall called!!!\n");
+            seek(f->R.rdi, f->R.rsi);
             break;
         }
         case SYS_TELL:
         {
-            printf("tell syscall called!!!\n");
+            f->R.rax = tell(f->R.rdi);
             break;
         }
         case SYS_CLOSE:
         {
-            // fd_list에서 fd를 가진 file_fd 찾아서
-            // 리스트에서 제거하고 file_fd 메모리 해제
-            close_handler(f->R.rdi);
+            close(f->R.rdi);
             break;
         }
     }
-}
-
-static bool check_bad_addr(const char *vaddr, struct thread *t)
-{
-    return pml4_get_page(t->pml4, vaddr);
-}
-
-/* 파일 또는 STDOUT으로 쓰기 */
-static int write_handler(int fd, const void *buffer, unsigned size)
-{
-    struct thread *current_thread = thread_current();
-
-    if (!is_fd_writable(fd) || check_bad_addr(buffer, current_thread) == NULL)
-    {
-        current_thread->tf.R.rax = -1;
-        thread_exit();
-    }
-
-    if (!(is_user_vaddr(buffer) && is_user_vaddr(buffer + size)))
-    {
-        return -1;
-    }
-
-    switch (fd)
-    {
-        case 1: /* fd가 1이면 표준 출력 (파일이 아니라 콘솔로 출력) */
-        {
-            putbuf(buffer, size);
-        }
-        default: /* open()으로 연 파일이 할당된 경우 */
-        {
-            struct file *file = process_get_file(fd);
-            if (file == NULL) return -1;
-            return file_write(file, buffer, size);
-        }
-    }
-}
-
-static int close_handler(int fd)
-{
-    struct thread *current_thread = thread_current();
-
-    if (fd < 2 || fd > 127)
-    {
-        return -1;
-    }
-
-    if (current_thread->fdt[fd] == NULL)
-    {
-        return -1;
-    }
-    else
-    {
-        current_thread->fdt[fd] = NULL;
-        free(current_thread->fdt[fd]);
-        return 0;
-    }
-}
-
-// 헌재 실행 중인 프로세스의 열린 파일 리스트에서 특정 파일 디스크립터(fd)에
-// 해당하는 파일 포인터를 찾아 반환
-struct file *process_get_file(int fd)
-{
-    struct thread *current_thread = thread_current();
-
-    if (current_thread->fdt[fd]->fd_type == FD_TYPE_FILE &&
-        current_thread->fdt[fd]->fd_ptr != NULL)
-    {
-        return current_thread->fdt[fd]->fd_ptr;
-    }
-    else
-    {
-        return NULL;
-    }
-}
-
-// 현재 실행 중인 프로세스의 열린 파일 리스트에 파일 추가
-int process_add_file(struct file *file)
-{
-    if (file == NULL)
-    {
-        return -1;
-    }
-
-    struct thread *current_thread = thread_current();
-
-    current_thread->fdt[current_thread->next_fd] =
-        malloc(sizeof(struct uni_file));
-
-    current_thread->fdt[current_thread->next_fd]->fd_type = FD_TYPE_FILE;
-    current_thread->fdt[current_thread->next_fd]->fd_ptr = file;
-
-    return current_thread->next_fd++;
 }

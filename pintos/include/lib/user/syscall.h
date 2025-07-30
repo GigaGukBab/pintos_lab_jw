@@ -7,7 +7,7 @@
 
 /* Process identifier. */
 typedef int pid_t;
-#define PID_ERROR ((pid_t) -1)
+#define PID_ERROR ((pid_t) - 1)
 
 /* Map region identifier. */
 typedef int off_t;
@@ -25,7 +25,7 @@ void halt(void) NO_RETURN;
 void exit(int status) NO_RETURN;
 pid_t fork(const char *thread_name);
 int exec(const char *file);
-int wait(pid_t);
+int wait(pid_t pid);
 bool create(const char *file, unsigned initial_size);
 bool remove(const char *file);
 int open(const char *file);

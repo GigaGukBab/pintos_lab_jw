@@ -10,11 +10,14 @@
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
+#include "include/lib/string.h"
 #include "include/threads/mmu.h"
+#include "include/userprog/syscall.h"
 #include "intrinsic.h"
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/mmu.h"
 #include "threads/palloc.h"
 #include "threads/synch.h"
@@ -78,19 +81,49 @@ static void initd(void *f_name)
     NOT_REACHED();
 }
 
-/* Clones the current process as `name`. Returns the new process's thread id, or
- * TID_ERROR if the thread cannot be created. */
+/* initialize fd_table. reserves stdin, stdout */
+void process_init_fdt(struct thread *t)
+{
+    t->fd_table[0] = malloc(sizeof(struct uni_file));
+    t->fd_table[1] = malloc(sizeof(struct uni_file));
+
+    t->fd_table[0]->type = FD_STDIN;
+    t->fd_table[0]->ptr = NULL;
+
+    t->fd_table[1]->type = FD_STDOUT;
+    t->fd_table[1]->ptr = NULL;
+}
+
+/* 현재 프로세스를 `name`으로 복제합니다.
+ * 복제된 프로세스의 스레드 ID를 반환하며,
+ * 스레드 생성에 실패할 경우 TID_ERROR를 반환합니다. */
 tid_t process_fork(const char *name, struct intr_frame *if_)
 {
     struct thread *curr = thread_current();
-    /* Clone current thread to new thread.*/
-    struct thread *fci_curr = malloc(sizeof(struct thread));
-    struct intr_frame *fci_if = malloc(sizeof(struct intr_frame));
-    memcpy(fci_if, if_, sizeof(if_));
-    curr->fci.curr = fci_curr;
-    curr->fci.if_ = fci_if;
 
-    return thread_create(name, PRI_DEFAULT, __do_fork, curr);
+    memcpy(&curr->parent_if, if_, sizeof(struct intr_frame));
+
+    /* PID: 복제된 자식 프로세스의 TID */
+    tid_t pid = thread_create(name, PRI_DEFAULT, __do_fork, curr);
+    if (pid == TID_ERROR)
+    {
+        return TID_ERROR;
+    }
+
+    struct thread *child = process_get_child(pid);
+
+    /* 부모 프로세스는 자식 프로세스의 fork 과정을 기다린다. */
+    sema_down(&child->fork_sema);
+
+    /* 자식 프로세스의 fork 과정이 어떤 결과로든 끝나면 이쪽이 실행된다.
+     * 이때 어떤 동작이 실패하여 자식의 종료 코드가 -1이면 부모가 실행하는
+     * process_fork 과정의 반환값은 TID_ERROR(-1)을 반환하도록 한다.  */
+    if (child->exit_status == TID_ERROR)
+    {
+        return TID_ERROR;
+    }
+
+    return pid;
 }
 
 #ifndef VM
@@ -112,17 +145,26 @@ static bool duplicate_pte(uint64_t *pte, void *va, void *aux)
 
     /* 2. Resolve VA from the parent's page map level 4. */
     parent_page = pml4_get_page(parent->pml4, va);
+    if (parent_page == NULL)
+    {
+        return false;
+    }
 
     /* 3. TODO: Allocate new PAL_USER page for the child and set result to
      *    TODO: NEWPAGE. */
-    newpage = palloc_get_page(PAL_USER);
+    newpage = palloc_get_page(PAL_USER | PAL_ZERO);
+    if (newpage == NULL)
+    {
+        return false;
+    }
 
     /* 4. TODO: Duplicate parent's page to the new page and
      *    TODO: check whether parent's page is writable or not (set WRITABLE
      *    TODO: according to the result). */
-    writable = is_writable(pte);
 
     memcpy(newpage, parent_page, PGSIZE);
+
+    writable = is_writable(pte);
 
     /* 5. Add new page to child's page table at address VA with WRITABLE
      *    permission. */
@@ -143,16 +185,16 @@ static bool duplicate_pte(uint64_t *pte, void *va, void *aux)
  *       this function. */
 static void __do_fork(void *aux)
 {
+    /* intr frame for jump to userland context */
     struct intr_frame if_;
-    struct fork_copy_info *fci = (struct fork_copy_info *) aux;
-    struct thread *parent = fci->curr;
-    struct intr_frame *parent_if = fci->if_;
-    struct thread *current = thread_current();  // 나 응애 자식
-    current->parent = parent;
+    struct thread *parent = (struct thread *) aux;
+    struct thread *current = thread_current();
+    struct intr_frame *parent_if = &parent->parent_if;
     bool succ = true;
 
     /* 1. Read the cpu context to local stack. */
     memcpy(&if_, parent_if, sizeof(struct intr_frame));
+    if_.R.rax = 0; /* 자식 프로세스의 return 값은 항상 0이다. */
 
     /* 2. Duplicate PT */
     current->pml4 = pml4_create();
@@ -166,24 +208,45 @@ static void __do_fork(void *aux)
     if (!pml4_for_each(parent->pml4, duplicate_pte, parent)) goto error;
 #endif
 
-    /* TODO: Your code goes here.
-     * TODO: Hint) To duplicate the file object, use `file_duplicate`
-     * TODO:       in include/filesys/file.h. Note that parent should not return
-     * TODO:       from the fork() until this function successfully duplicates
-     * TODO:       the resources of parent.*/
+    /* duplciate parent's fd to child.
+     * uni_file이 NULL이 아닐때만 복사합니다.
+     * fils_duplicate에 실패하면 fork가 실패합니다. */
+    lock_acquire(&filesys_lock);
+    for (int fd = 2; fd < FDTABLE_SIZE; fd++)
+    {
+        if (parent->fd_table[fd] != NULL)
+        {
+            struct file *file = parent->fd_table[fd]->ptr;
+            if (file != NULL)
+            {
+                struct file *dup_file = file_duplicate(file);
+                if (dup_file == NULL)
+                {
+                    succ = false;
+                    break;
+                }
+                current->fd_table[fd] = malloc(sizeof(struct uni_file));
+                current->fd_table[fd]->type = FD_FILE;
+                current->fd_table[fd]->ptr = dup_file;
+            }
+        }
+    }
+    lock_release(&filesys_lock);
+    current->next_fd = parent->next_fd;
 
     process_init();
 
-    /* 부모 프로세스로부터 자식 프로세스로의 복제 과정을 성공적으로 마쳤다면, */
+    /* 부모 프로세스 -> 프로세스로 복제 과정을 성공적으로 마쳤다면, */
     if (succ)
     {
-        /* 자식 프로세스의 반환값을 0으로 설정*/
-        if_.R.rax = 0;
+        /* 자식 프로세스는 부모 프로세스에게 성공적으로 복사 과정을 마쳤다는
+         * 것을 알려주면 된다.*/
+        sema_up(&current->fork_sema);
         /* Finally, switch to the newly created process. */
         do_iret(&if_);
     }
 error:
-    if_.R.rax = TID_ERROR;
+    sema_up(&current->fork_sema);
     thread_exit();
 }
 
@@ -191,14 +254,27 @@ error:
  * Returns -1 on fail. */
 int process_exec(void *f_name)
 {
-    char *file_name = f_name;
-    bool success;
-    /* passing */
-    char *argv[MAX_ARGS];
+    char *fn_copy = f_name;
+    char *argv[MAX_ARGS], *token, *save_ptr;
     int argc = 0;
-    char *token, *save_ptr;
+    bool success;
+    if (is_user_vaddr(f_name))
+    {
+        /* copy userland address to kernel area */
+        fn_copy = palloc_get_page(PAL_ZERO);
+        if (fn_copy == NULL)
+        {
+            return -1;
+        }
+        strlcpy(fn_copy, f_name, PGSIZE);
+    }
+    else
+    {
+        /* use straightforward if f_name is already kernel addr */
+        fn_copy = f_name;
+    }
 
-    for (token = strtok_r(file_name, " ", &save_ptr); token != NULL;
+    for (token = strtok_r(fn_copy, " ", &save_ptr); token != NULL;
          token = strtok_r(NULL, " ", &save_ptr))
     {
         argv[argc++] = token;
@@ -220,58 +296,145 @@ int process_exec(void *f_name)
     process_cleanup();
 
     /* And then load the binary */
-    success = load(argv[0], &_if, argv, argc);
+    success = load(fn_copy, &_if, argv, argc);
 
     /* If load failed, quit. */
-    palloc_free_page(file_name);
-    if (!success) return -1;
+    palloc_free_page(fn_copy);
+    if (!success)
+    {
+        return -1;
+    }
 
     /* Start switched process. */
     do_iret(&_if);
     NOT_REACHED();
 }
 
-/* Waits for thread TID to die and returns its exit status.  If
- * it was terminated by the kernel (i.e. killed due to an
- * exception), returns -1.  If TID is invalid or if it was not a
- * child of the calling process, or if process_wait() has already
- * been successfully called for the given TID, returns -1
- * immediately, without waiting.
- *
- * This function will be implemented in problem 2-2.  For now, it
- * does nothing. */
-int process_wait(tid_t child_tid)
+/* 해당 file descriptor 번호로 fdt에서 파일을 찾아 반환. */
+struct uni_file *process_get_file(int fd)
 {
     struct thread *curr = thread_current();
-    struct list_elem *e;
-    struct thread *child_thread;
 
-    for (e = list_begin(&curr->child_list); e != list_end(&curr->child_list);
-         e = list_next(e))
+    if (curr->fd_table[fd] == NULL)
     {
-        child_thread = list_entry(e, struct thread, elem);
-        if (child_thread->tid == child_tid && child_thread->exit_status != -1)
-        {
-            sema_down(&curr->thread_sema);
-            return child_thread->exit_status;
-        }
-        else
-        {
-            return -1;
-        }
+        return NULL;
+    }
+    return curr->fd_table[fd];
+}
+
+/* 현재 실행 중인 프로세스의 열린 파일 리스트에 파일 추가
+ * 파일 디스크립터 handle 번호 반환. */
+int process_add_file(struct file *file)
+{
+    if (file == NULL)
+    {
+        return -1;
     }
 
-    sema_down(&curr->thread_sema);
-    return curr->exit_status;
+    struct thread *curr = thread_current();
+
+    curr->fd_table[curr->next_fd] = malloc(sizeof(struct uni_file));
+
+    curr->fd_table[curr->next_fd]->type = FD_FILE;
+    curr->fd_table[curr->next_fd]->ptr = file;
+
+    return curr->next_fd++;
+}
+
+/* fork로부터 반환된 child의 tid로 현재 부모 프로세스의 자식 리스트에서
+ * 해당 자식 프로세스가 등록되어있는지 확인한다.
+ * 자식이 있으면 해당 자식 스레드 구조체를 반환하고, 없으면 NULL을 반환한다. */
+struct thread *process_get_child(tid_t tid)
+{
+    struct thread *cur = thread_current();
+    struct list *child_list = &cur->child_list;
+
+    for (struct list_elem *e = list_begin(child_list);
+         e != list_end(child_list); e = list_next(e))
+    {
+        struct thread *t = list_entry(e, struct thread, child_elem);
+        if (t->tid == tid) return t;
+    }
+    return NULL;
+}
+
+/* 스레드 TID가 종료될 때까지 대기하고, 종료 상태(exit status)를 반환합니다.
+ * 만약 커널에 의해 종료되었을 경우(즉 예외로 인해 강제 종료된 경우), -1을
+ * 반환합니다. TID가 유효하지 않거나 호출 프로세스의 자식이 아니거나, 이미 해당
+ * TID에 대해 process_wait()가 성공적으로 호출된 적이 있다면, 대기 없이 즉시
+ * -1을 반환합니다. */
+int process_wait(tid_t child_tid)
+{
+    struct thread *child = process_get_child(child_tid);
+
+    /* 현재 부모의 직계 자식이 아닌 경우 즉시 -1 반환 */
+    if (child == NULL)
+    {
+        return -1;
+    }
+
+    /* 이미 해당 TID에 대해 wait를 호출한 적이 있다면 즉시 -1 반환*/
+    if (child->wait_called)
+    {
+        return -1;
+    }
+    child->wait_called = true;
+
+    /* 자식 프로세스의 실행이 끝날 때 까지 대기 */
+    sema_down(&child->wait_sema);
+
+    /* 자식 프로세스가 wait sema에 대해 sema up을 하게 된다는 것은 자식의
+     * 실행이 모두 끝났다는 것을 의미한다. 그러므로 부모의 자식 리스트에서 현재
+     * 자식을 제거한다. */
+    list_remove(&child->child_elem);
+
+    /* 부모는 자식의 종료 과정을 확인하고 다시 exit_sema를 올려서 자식의 종료
+     * 과정을 정상적으로 처리할 수 있도록 한다.*/
+    sema_up(&child->exit_sema);
+
+    /* 자식의 종료 코드를 반환한다. */
+    return child->exit_status;
 }
 
 /* Exit the process. This function is called by thread_exit (). */
 void process_exit(void)
 {
-    struct thread *curr = thread_current();  // 나 응애 자식
-    sema_up(&curr->parent->thread_sema);
+    struct thread *curr = thread_current();
 
-    printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+    /* 자식 프로세스가 종료되었음을 부모에게 알림.
+     * 부모는 process_wait()에서 wait_sema를 기다리고 있다. */
+    sema_up(&curr->wait_sema);
+
+    /* close execution file here */
+    if (curr->running_file != NULL)
+    {
+        lock_acquire(&filesys_lock);
+        file_close(curr->running_file);
+        curr->running_file = NULL;
+        lock_release(&filesys_lock);
+    }
+
+    /* malloc으로 할당했던 모든 파일디스크립터 정리 */
+    for (int i = 0; i < FDTABLE_SIZE; i++)
+    {
+        if (curr->fd_table[i] != NULL)
+        {
+            struct uni_file *uni_file = curr->fd_table[i];
+
+            lock_acquire(&filesys_lock);
+            file_close((struct file *) uni_file->ptr);
+            lock_release(&filesys_lock);
+
+            free(uni_file);
+            curr->fd_table[i] = NULL;
+        }
+    }
+
+    /* 이후 부모가 자식의 종료 상태를 알 수 있도록 exit_sema를 활용해
+     * 자식은 다시 잠든다. */
+    sema_down(&curr->exit_sema);
+
+    /* 부모가 exit_sema로 깨웠을 때 마무리 작업을 통해 프로세스를 정리한다. */
     process_cleanup();
 }
 
@@ -390,23 +553,24 @@ static bool load(const char *file_name, struct intr_frame *if_, char **argv,
     int i;
     char *unused_ptr;
 
-    // file_name = strtok_r(file_name, " ", &unused_ptr);
-    // memset(unused_ptr + 1, 0, (strlen(unused_ptr + 1)));
-    // file_name = strlcpy(file_name, file_name, strlen(file_name));
-
     /* Allocate and activate page directory. */
     t->pml4 = pml4_create();
     if (t->pml4 == NULL) goto done;
     process_activate(thread_current());
 
     /* Open executable file. */
+
+    lock_acquire(&filesys_lock);
     file = filesys_open(file_name);
+    lock_release(&filesys_lock);
+
     if (file == NULL)
     {
         printf("load: %s: open failed\n", file_name);
         goto done;
     }
 
+    lock_acquire(&filesys_lock);
     /* Read and verify executable header. */
     if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
         memcmp(ehdr.e_ident, "\177ELF\2\1\1", 7) || ehdr.e_type != 2 ||
@@ -417,8 +581,10 @@ static bool load(const char *file_name, struct intr_frame *if_, char **argv,
         printf("load: %s: error loading executable\n", file_name);
         goto done;
     }
+    lock_release(&filesys_lock);
 
     /* Read program headers. */
+    lock_acquire(&filesys_lock);
     file_ofs = ehdr.e_phoff;
     for (i = 0; i < ehdr.e_phnum; i++)
     {
@@ -476,6 +642,12 @@ static bool load(const char *file_name, struct intr_frame *if_, char **argv,
                 break;
         }
     }
+    lock_release(&filesys_lock);
+
+    /* deny write on executing file */
+    lock_acquire(&filesys_lock);
+    file_deny_write(file);
+    lock_release(&filesys_lock);
 
     /* Set up stack. */
     if (!setup_stack(if_, argv, argc)) goto done;
@@ -487,7 +659,8 @@ static bool load(const char *file_name, struct intr_frame *if_, char **argv,
 
 done:
     /* We arrive here whether the load is successful or not. */
-    file_close(file);
+    /* save current execution file info on thread struct. */
+    t->running_file = file;
     return success;
 }
 

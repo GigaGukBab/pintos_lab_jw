@@ -136,16 +136,9 @@ void thread_start(void)
     struct semaphore idle_started;
     sema_init(&idle_started, 0);
 
-    struct thread *initial_thread = thread_current();
+    /* intialize main thread's fd table */
+    process_init_fdt(thread_current());
 
-    initial_thread->file_descriptor_table[0] = malloc(sizeof(struct uni_file));
-    initial_thread->file_descriptor_table[1] = malloc(sizeof(struct uni_file));
-
-    initial_thread->file_descriptor_table[0]->fd_type = FD_TYPE_STDIN;
-    initial_thread->file_descriptor_table[0]->fd_ptr = NULL;
-
-    initial_thread->file_descriptor_table[1]->fd_type = FD_TYPE_STDOUT;
-    initial_thread->file_descriptor_table[1]->fd_ptr = NULL;
     thread_create("idle", PRI_MIN, idle, &idle_started);
 
     /* Start preemptive thread scheduling. */
@@ -181,21 +174,20 @@ void thread_print_stats(void)
            idle_ticks, kernel_ticks, user_ticks);
 }
 
-/* Creates a new kernel thread named NAME with the given initial
-         PRIORITY, which executes FUNCTION passing AUX as the argument,
-         and adds it to the ready queue.  Returns the thread identifier
-         for the new thread, or TID_ERROR if creation fails.
+/* 새로운 커널 스레드를 NAME이라는 이름과 PRIORITY라는 초기 우선순위로 생성하여,
+   FUNCTION을 실행하고 AUX를 인자로 전달하며 준비 큐에 추가합니다.
+   생성에 성공하면 새 스레드의 식별자를 반환하고, 실패하면 TID_ERROR를
+   반환합니다.
 
-         If thread_start() has been called, then the new thread may be
-         scheduled before thread_create() returns.  It could even exit
-         before thread_create() returns.  Contrariwise, the original
-         thread may run for any amount of time before the new thread is
-         scheduled.  Use a semaphore or some other form of
-         synchronization if you need to ensure ordering.
+   thread_start()가 호출된 이후라면, 새로운 스레드는 thread_create()가 반환되기
+   전에 스케줄될 수 있습니다. 심지어 thread_create()가 반환되기 전에 종료될 수도
+   있습니다. 반대로, 원래 스레드가 새로운 스레드가 스케줄되기 전까지 언제든지
+   실행될 수도 있습니다. 순서 보장이 필요하다면 세마포어나 다른 동기화 수단을
+   사용하세요.
 
-         The code provided sets the new thread's `priority' member to
-         PRIORITY, but no actual priority scheduling is implemented.
-         Priority scheduling is the goal of Problem 1-3. */
+   제공된 코드는 새 스레드의 `priority` 멤버를 PRIORITY로 설정하지만,
+   실제 우선순위 스케줄링은 구현되어 있지 않습니다.
+   우선순위 스케줄링 구현은 문제 1-3의 목표입니다. */
 tid_t thread_create(const char *name, int priority, thread_func *function,
                     void *aux)
 {
@@ -223,32 +215,18 @@ tid_t thread_create(const char *name, int priority, thread_func *function,
     t->tf.cs = SEL_KCSEG;
     t->tf.eflags = FLAG_IF;
 
-    t->file_descriptor_table[0] = malloc(sizeof(struct uni_file));
-    t->file_descriptor_table[1] = malloc(sizeof(struct uni_file));
+    /* initialize new thread's fd table */
+    process_init_fdt(t);
 
-    t->file_descriptor_table[0]->fd_type = FD_TYPE_STDIN;
-    t->file_descriptor_table[0]->fd_ptr = NULL;
+    /* register child to parent */
+    list_push_back(&thread_current()->child_list, &t->child_elem);
 
-    t->file_descriptor_table[1]->fd_type = FD_TYPE_STDOUT;
-    t->file_descriptor_table[1]->fd_ptr = NULL;
-
-    /* Add to run queue. */
+    /* Add to ready list. */
     thread_unblock(t);
-
-    /* compare the priorities of the currently running thread
-     * and the newly inserted one. Yield the CPU if the newly
-     * arriving thread has higer priority*/
 
     enum intr_level old_level = intr_disable();
 
-    if (!list_empty(&ready_list))
-    {
-        if (thread_current()->priority <
-            list_entry(list_front(&ready_list), struct thread, elem))
-        {
-            thread_yield();
-        }
-    }
+    thread_yield_r();
 
     intr_set_level(old_level);
 
@@ -311,7 +289,7 @@ void thread_sleep(int64_t wakeup_tick)
     }
 }
 
-void thread_wakeup()
+void thread_wakeup(void)
 {
     enum intr_level old_level = intr_disable();
 
@@ -439,8 +417,11 @@ void thread_yield(void)
     intr_set_level(old_level);
 }
 
-/* safe yield for now...
+/* performs safe yield
  * shout out to S.J.Kim */
+/* compare the priorities of the currently running thread
+ * and the newly inserted one. Yield the CPU if the newly
+ * arriving thread has higer priority*/
 void thread_yield_r(void)
 {
     enum intr_level old_level = intr_disable();
@@ -567,6 +548,13 @@ static void init_thread(struct thread *t, const char *name, int priority)
     t->priority = priority;
     t->magic = THREAD_MAGIC;
     t->next_fd = 2;
+
+    sema_init(&t->wait_sema, 0);
+    sema_init(&t->fork_sema, 0);
+    sema_init(&t->exit_sema, 0);
+    t->load_success = false;
+
+    list_init(&t->child_list);
 }
 
 /* Chooses and returns the next thread to be scheduled.  Should
